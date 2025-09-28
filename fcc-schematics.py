@@ -11,11 +11,11 @@ OUTDIR = "fcc_exhibits"
 SLEEP = 0.4
 
 session = requests.Session()
-session.headers["User-Agent"] = "fcc-exhibit-downloader/1.1"
+session.headers["User-Agent"] = "fcc-exhibit-downloader/1.2"
 
 os.makedirs(OUTDIR, exist_ok=True)
 
-def slugify(s, maxlen=120):
+def slugify(s, maxlen=140):
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
     s = re.sub(r"[^\w\s.-]", "", s).strip()
     s = re.sub(r"\s+", "_", s)
@@ -27,14 +27,15 @@ def fetch_html(url):
     return r.text
 
 def nearby_text_contains_pdf_marker(a_tag, window_nodes=12):
-    """Look through the next few nodes after the anchor for the marker."""
+    """Look through the next few nodes after the anchor for 'Adobe Acrobat PDF'."""
     texts = []
     for node in itertools.islice(a_tag.next_elements, 0, window_nodes):
         if isinstance(node, Tag) and node.name == "a":
-            # stop if we hit the next link block
-            break
-        if isinstance(node, (NavigableString, Tag)):
-            texts.append(node.get_text(" ", strip=True) if isinstance(node, Tag) else str(node))
+            break  # next link block → stop lookahead
+        if isinstance(node, Tag):
+            texts.append(node.get_text(" ", strip=True))
+        elif isinstance(node, NavigableString):
+            texts.append(str(node))
     blob = " ".join(texts).lower()
     return "adobe acrobat pdf" in blob
 
@@ -59,52 +60,84 @@ def pick_pdf_from_exhibit(ex_url, html):
 
     return None
 
-def download(url, base_name):
-    fname = slugify(base_name)
-    # try to keep .pdf; infer from URL if missing
-    ext = os.path.splitext(urlparse(url).path)[1] or ".pdf"
-    out = os.path.join(OUTDIR, fname + ext)
+DOCID_RE = re.compile(r"-(\d+)\.pdf$", re.I)
 
-    # avoid overwriting
-    stem, ext_only = os.path.splitext(out)
-    i = 2
-    while os.path.exists(out):
-        out = f"{stem}({i}){ext_only}"
-        i += 1
+def extract_doc_id(pdf_url: str) -> str:
+    """Get trailing numeric id like ...-8024702.pdf -> '8024702' (optional)."""
+    m = DOCID_RE.search(pdf_url)
+    if m:
+        return m.group(1)
+    # fallback: any digits at end of path without extension
+    path = urlparse(pdf_url).path
+    base = os.path.basename(path)
+    base_noext, _ = os.path.splitext(base)
+    tail_digits = re.search(r"(\d+)$", base_noext)
+    return tail_digits.group(1) if tail_digits else ""
 
-    print(f"↓ {url}\n→ {out}")
-    with session.get(url, stream=True, timeout=120) as r:
+def remote_size(url: str) -> int | None:
+    try:
+        h = session.head(url, allow_redirects=True, timeout=30)
+        if 200 <= h.status_code < 400:
+            cl = h.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                return int(cl)
+    except requests.RequestException:
+        pass
+    return None
+
+def download(pdf_url, base_title):
+    # build a filename that includes the doc id to reduce collisions
+    docid = extract_doc_id(pdf_url)
+    title_slug = slugify(base_title)
+    fname = f"{title_slug}{('_' + docid) if docid else ''}.pdf"
+    out = os.path.join(OUTDIR, fname)
+
+    # if a file already exists with same name & same size as remote, skip
+    rsize = remote_size(pdf_url)
+    if os.path.exists(out) and rsize is not None:
+        lsize = os.path.getsize(out)
+        if lsize == rsize:
+            print(f"skip (already have identical file): {out}")
+            return
+
+    print(f"↓ {pdf_url}\n→ {out}")
+    with session.get(pdf_url, stream=True, timeout=180) as r:
         r.raise_for_status()
         tmp = out + ".part"
         with open(tmp, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=1024*64):
+            for chunk in r.iter_content(chunk_size=1024 * 64):
                 if chunk:
                     fh.write(chunk)
         os.replace(tmp, out)
     print("✓ saved\n")
-
 
 def main():
     print(f"Scanning: {START_URL}")
     main_html = fetch_html(START_URL)
     soup = BeautifulSoup(main_html, "html.parser")
 
-    # Collect exhibit links whose nearby text says "Adobe Acrobat PDF"
-    exhibits = []
+    # 1) Collect exhibit page links whose nearby text says "Adobe Acrobat PDF"
+    exhibit_pages = []
     for a in soup.find_all("a", href=True):
         href = urljoin(START_URL, a["href"])
-        # keep only links that stay under this FCC ID path and are not the root
         if "/BCG-E8726A/" in href and href.rstrip("/") != START_URL.rstrip("/"):
             if nearby_text_contains_pdf_marker(a):
                 title = (a.get_text() or "").strip() or "exhibit"
-                exhibits.append((href, title))
+                exhibit_pages.append((href, title))
 
-    # de-dup, preserve order
-    seen = set()
-    uniq = [(u, t) for (u, t) in exhibits if not (u in seen or seen.add(u))]
-    print(f"Found {len(uniq)} exhibit pages marked as PDF.\n")
+    # de-dup exhibit pages (by URL), preserve order
+    seen_ex_pages = set()
+    ex_pages = []
+    for u, t in exhibit_pages:
+        if u not in seen_ex_pages:
+            ex_pages.append((u, t))
+            seen_ex_pages.add(u)
 
-    for ex_url, title in uniq:
+    print(f"Found {len(ex_pages)} exhibit pages marked as PDF.\n")
+
+    # 2) Visit each exhibit page → find the actual PDF URL
+    seen_pdf_urls = set()  # de-dup by final file URL
+    for ex_url, title in ex_pages:
         try:
             time.sleep(SLEEP)
             ex_html = fetch_html(ex_url)
@@ -112,7 +145,17 @@ def main():
             if not pdf_url:
                 print(f"! No PDF link found on: {ex_url}")
                 continue
+
+            # de-dup: skip if we already queued/downloaded this exact PDF URL
+            if pdf_url in seen_pdf_urls:
+                print(f"skip (same PDF URL already handled): {pdf_url}")
+                continue
+            seen_pdf_urls.add(pdf_url)
+
             download(pdf_url, title)
+
+        except requests.HTTPError as e:
+            print(f"! HTTP error for {ex_url}: {e}")
         except Exception as e:
             print(f"! Error on {ex_url}: {e}")
 
